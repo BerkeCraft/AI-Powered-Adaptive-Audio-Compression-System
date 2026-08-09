@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RVQ-GAN tabanlı ses sıkıştırma modülü (EnCodec kullanılarak)
+"""
+
+import numpy as np
+import zlib
+
+# Try to import the required libraries for EnCodec
+try:
+    import torch
+    import torchaudio
+    from encodec.model import EncodecModel
+    _encodec_available = True
+except ImportError:
+    _encodec_available = False
+
+import compressors  # For Huffman coding
+
+# Global model variable to avoid reloading
+_model = None
+_target_sample_rate = 24000  # EnCodec model expects 24kHz
+_target_channel = 1  # Mono
+
+def _load_model():
+    """EnCodec modelini yükler (ilk çağrıldığında)"""
+    global _model
+    if not _encodec_available:
+        return None
+    if _model is None:
+        print("Model yükleniyor...")
+        try:
+            _model = EncodecModel.encodec_model_24khz()
+            _model.set_target_bandwidth(6.0)  # 6 kbps
+            print("Model yüklendi.")
+        except Exception as e:
+            print(f"Model yükleme hatası: {e}")
+            _model = None  # Mark as failed to avoid retrying
+    return _model
+
+def encode_with_rvqgan(audio_array, sample_rate):
+    """
+    Ses verisini EnCodec ile kodlar ve ardından Huffman ile sıkıştırır.
+    
+    Args:
+        audio_array (numpy array): Mono ses verisi (float32, -1 ile 1 arasında)
+        sample_rate (int): Orijinal örnekleme frekansı
+        
+    Returns:
+        tuple: (compressed_bytes, metadata)
+            compressed_bytes: Sıkıştırılmış veri (bytes)
+            metadata: metadata dict (original_shape, sample_rate, encodec_bandwidth, huffman_table)
+    """
+    # Check if model is available
+    if not _encodec_available:
+        raise ImportError("Encodec modeli kullanılamıyor. Lütfen 'pip install encodec torch torchaudio' komutunu çalıştırın.")
+        
+    model = _load_model()
+    if model is None:
+        raise ImportError("Encodec modeli kullanılamıyor.")
+    
+    # Convert to torch tensor and reshape to (channels, samples)
+    # Ensure mono
+    if audio_array.ndim == 1:
+        audio_array = audio_array.reshape(1, -1)
+    elif audio_array.ndim == 2 and audio_array.shape[0] > 1:
+        # If stereo, take first channel or average? We'll take first for simplicity.
+        audio_array = audio_array[0:1, :]
+    
+    # Convert to torch tensor
+    audio_tensor = torch.from_numpy(audio_array).float()
+    
+    # Resample if necessary
+    if sample_rate != _target_sample_rate:
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=_target_sample_rate)
+        audio_tensor = resampler(audio_tensor)
+        # Update sample rate for metadata
+        effective_sample_rate = _target_sample_rate
+    else:
+        effective_sample_rate = sample_rate
+    
+    # Normalize to [-1, 1] (should already be, but ensure)
+    audio_tensor = torch.clamp(audio_tensor, -1.0, 1.0)
+    
+    # EnCodec expects a batch dimension
+    audio_tensor = audio_tensor.unsqueeze(0)  # (1, channels, samples)
+    
+    # Encode with EnCodec
+    encoded_frames = model.encode(audio_tensor)
+    # encoded_frames is a list of tuples (codes, scale) for each frame
+    # We'll concatenate all codes and scales
+    all_codes = []
+    all_scales = []
+    for frames in encoded_frames:
+        # Skip if frames is None
+        if frames is None:
+            continue
+        try:
+            codes, scale = frames
+        except (TypeError, ValueError):
+            continue
+        # Skip if codes is None
+        if codes is None:
+            continue
+        # If scale is None, we need to handle it - create a dummy scale tensor
+        # with the same shape as codes but filled with ones (or zeros)
+        if scale is None:
+            # Create a scale tensor with same shape as codes but on the same device
+            scale = torch.ones_like(codes, dtype=torch.float32)
+        all_codes.append(codes)
+        all_scales.append(scale)
+    
+    # Check if we have any valid frames
+    if not all_codes:
+        raise ValueError("EnCodec encoding did not produce any valid frames")
+    
+    # Concatenate along time dimension
+    codes = torch.cat(all_codes, dim=-1)  # (1, n_q, t)
+    scales = torch.cat(all_scales, dim=-1)  # (1, n_q, t)
+    
+    # Convert to numpy and then to bytes for Huffman coding
+    # We'll quantize the scales? Actually, EnCodec codes are integers, scales are floats.
+    # We'll handle codes and scales separately.
+    # For simplicity, we'll concatenate codes and scales and then apply Huffman.
+    # But note: codes are integers (quantized), scales are floats.
+    # We'll convert everything to bytes.
+    
+    # Convert codes to int16 (they are small integers) and scales to float32
+    codes_np = codes.squeeze(0).cpu().numpy().astype(np.int16)  # (n_q, t)
+    scales_np = scales.squeeze(0).cpu().numpy().astype(np.float32)  # (n_q, t)
+    
+    # Interleave codes and scales? Or store separately? We'll store as: [codes_bytes, scales_bytes]
+    # But for Huffman, we want a byte stream. We'll convert each to bytes and then concatenate.
+    codes_bytes = codes_np.tobytes()
+    scales_bytes = scales_np.tobytes()
+    
+     # Combine: first 4 bytes for length of codes_bytes, then codes_bytes, then scales_bytes
+     # This way we can split during decoding.
+     codes_len = len(codes_bytes)
+     header = codes_len.to_bytes(4, byteorder='little')
+     combined_bytes = header + codes_bytes + scales_bytes
+     
+     # DEBUG: Print intermediate sizes
+     print(f"[RVQ-GAN] EnCodec sonrası boyut: {len(combined_bytes)} bytes")
+     
+     # Apply Huffman coding on the combined bytes
+     try:
+         huffman_encoded = compressors.huffman_encode(combined_bytes)
+         # If Huffman fails (e.g., single byte) or doesn't reduce size, we use the combined_bytes directly
+         if huffman_encoded is None or len(huffman_encoded) >= len(combined_bytes):
+             # Use the original combined_bytes as Huffman didn't help
+             compressed_data = combined_bytes
+         else:
+             compressed_data = huffman_encoded
+     except Exception as e:
+         # If Huffman fails, use zlib
+         compressed_data = zlib.compress(combined_bytes, level=6)
+    
+    # Prepare metadata
+    metadata = {
+        'original_shape': audio_array.shape,
+        'original_sample_rate': sample_rate,
+        'effective_sample_rate': effective_sample_rate,
+        'target_sample_rate': _target_sample_rate,
+        'encodec_bandwidth': 6.0,  # We set it to 6.0 kbps
+        'huffman_used': True,  # We always try Huffman
+        'codes_shape': codes_np.shape,
+        'scales_shape': scales_np.shape,
+        'codes_len': codes_len
+    }
+    
+    return compressed_data, metadata
+
+def decode_with_rvqgan(compressed_bytes, metadata):
+    """
+    Sıkıştırılmış veri ve metadata ile ses verisini yeniden oluşturur.
+    
+    Args:
+        compressed_bytes (bytes): Sıkıştırılmış veri
+        metadata (dict): encode_with_rvqgan tarafından dönen metadata
+        
+    Returns:
+        numpy array: Decode edilmiş ses verisi (float32, -1 ile 1之间)
+    """
+    # Check if model is available
+    if not _encodec_available:
+        raise ImportError("Encodec modeli kullanılamıyor.")
+        
+    model = _load_model()
+    if model is None:
+        raise ImportError("Encodec modeli kullanılamıyor.")
+    
+    # Try to decode Huffman first
+    try:
+        # Attempt Huffman decode
+        combined_bytes = compressors.huffman_decode(compressed_bytes)
+    except Exception as e:
+        # If Huffman decode fails, assume it was not Huffman encoded (or zlib fallback)
+        # Actually, in our encode function, we used Huffman only if beneficial, else we used the combined_bytes directly.
+        # But note: we also had a fallback to zlib. So we need to check.
+        # Since we don't have a marker, we'll try to decode as if it was Huffman, and if it fails, we try zlib.
+        # However, for simplicity, we'll assume that if Huffman decode fails, it was zlib compressed.
+        try:
+            combined_bytes = zlib.decompress(compressed_bytes)
+        except Exception as e2:
+            raise ValueError(f"Neither Huffman nor zlib decompression worked: {e}, {e2}")
+    
+    # Now split combined_bytes into codes_bytes and scales_bytes
+    # First 4 bytes are the length of codes_bytes
+    if len(combined_bytes) < 4:
+        raise ValueError("Combined bytes too short for header")
+    
+    codes_len = int.from_bytes(combined_bytes[:4], byteorder='little')
+    codes_bytes = combined_bytes[4:4+codes_len]
+    scales_bytes = combined_bytes[4+codes_len:]
+    
+    # Convert bytes back to numpy arrays
+    codes_np = np.frombuffer(codes_bytes, dtype=np.int16)
+    scales_np = np.frombuffer(scales_bytes, dtype=np.float32)
+    
+    # Reshape to original shape from metadata
+    codes_np = codes_np.reshape(metadata['codes_shape'])
+    scales_np = np.reshape(scales_np, metadata['scales_shape'])
+    
+    # Convert back to torch tensors
+    codes_tensor = torch.from_numpy(codes_np).unsqueeze(0)  # (1, n_q, t)
+    scales_tensor = torch.from_numpy(scales_np).unsqueeze(0)  # (1, n_q, t)
+    
+    # Create frames list for EnCodec decode
+    # EnCodec decode expects a list of tuples (codes, scale) for each frame?
+    # Actually, the encode function returns a list of frames, each frame is (codes, scale).
+    # But we have concatenated all frames. We need to split by frame?
+    # However, the model's encode function does not specify frame size. We'll assume the entire stream is one frame?
+    # Looking at EnCodec documentation, the encode function returns a list of frames, but we can treat the whole as one frame.
+    # We'll create a single frame.
+    encoded_frames = [(codes_tensor, scales_tensor)]
+    
+    # Decode
+    audio_tensor = model.decode(encoded_frames)
+    # audio_tensor is (1, channels, samples)
+    
+    # Remove batch dimension
+    audio_tensor = audio_tensor.squeeze(0)
+    
+    # If we had stereo and we took only first channel, we now have mono.
+    # Convert to numpy
+    audio_np = audio_tensor.detach().cpu().numpy()
+    
+    # If we resampled, we need to resample back to original sample rate
+    if metadata['effective_sample_rate'] != metadata['original_sample_rate']:
+        resampler = torchaudio.transforms.Resample(
+            orig_freq=metadata['effective_sample_rate'],
+            new_freq=metadata['original_sample_rate']
+        )
+        # Resampler expects (channels, samples)
+        if audio_np.ndim == 1:
+            audio_np = audio_np.reshape(1, -1)
+        audio_np = resampler(torch.from_numpy(audio_np)).numpy()
+        # Ensure mono if we started with mono
+        if audio_np.shape[0] > 1 and metadata['original_shape'][0] == 1:
+            audio_np = audio_np[0:1, :]
+    
+    # Ensure shape matches original
+    if audio_np.shape != metadata['original_shape']:
+        # If we have extra dimension (e.g., (1, samples) vs (samples,)), squeeze or reshape
+        if len(audio_np.shape) == 2 and audio_np.shape[0] == 1 and len(metadata['original_shape']) == 1:
+            audio_np = audio_np.squeeze(0)
+        elif len(audio_np.shape) == 1 and len(metadata['original_shape']) == 2 and metadata['original_shape'][0] == 1:
+            audio_np = audio_np.reshape(1, -1)
+    
+    return audio_np
+
+def get_rvqgan_stats(original_array, compressed_bytes, decoded_array, sample_rate):
+    """
+    RVQ-GAN sıkıştırma istatistiklerini hesaplar.
+    
+    Args:
+        original_array (numpy array): Orijinal ses verisi (int16)
+        compressed_bytes (bytes): Sıkıştırılmış veri
+        decoded_array (numpy array): Decode edilmiş ses verisi (int16)
+        sample_rate (int): Örnekleme frekansı
+        
+    Returns:
+        dict: {compression_ratio, snr_db, original_size, compressed_size}
+    """
+    original_size = original_array.nbytes
+    compressed_size = len(compressed_bytes)
+    
+    # Avoid division by zero
+    if original_size == 0:
+        compression_ratio = 0.0
+    else:
+        compression_ratio = 1.0 - (compressed_size / original_size)
+    
+    # Calculate SNR (assuming decoded_array is int16, same as original)
+    from utils import calculate_snr
+    snr_db = calculate_snr(original_array.astype(np.float64), decoded_array.astype(np.float64))
+    
+    return {
+        'compression_ratio': compression_ratio,
+        'snr_db': snr_db,
+        'original_size': original_size,
+        'compressed_size': compressed_size
+    }
+
+def compress_rvqgan(audio_array, sample_rate):
+    """
+    compressors.py tarafından çağrılan ana fonksiyon.
+    Orijinal ses verisini (int16) alır, float32'e çevirir, işler ve sıkıştırılmış bytes döndürür.
+    
+    Args:
+        audio_array (numpy array): Orijinal ses verisi (int16)
+        sample_rate (int): Örnekleme frekansı
+        
+    Returns:
+        bytes: Sıkıştırılmış veri
+    """
+    # Check if model is available
+    if not _encodec_available:
+        print("RVQ-GAN: Encodec modeli kullanılamıyor, orijinal veri döndürülüyor")
+        return audio_array.tobytes()
+        
+    # Convert int16 to float32 in range [-1, 1]
+    if audio_array.dtype == np.int16:
+        audio_float = audio_array.astype(np.float32) / 32768.0
+    elif audio_array.dtype == np.int32:
+        audio_float = audio_array.astype(np.float32) / 2147483648.0
+    else:
+        # Assume already float
+        audio_float = audio_array.astype(np.float32)
+    
+    # Clip to avoid overflow
+    audio_float = np.clip(audio_float, -1.0, 1.0)
+    
+    try:
+        compressed_bytes, _ = encode_with_rvqgan(audio_float, sample_rate)
+        return compressed_bytes
+    except Exception as e:
+        print(f"RVQ-GAN sıkıştırma hatası: {e}, bu strateji atlanıyor")
+        # Return original data as fallback so that the strategy still works (zero compression)
+        return audio_array.tobytes()

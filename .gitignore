@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Sanal ortam
+venv/
+env/
+.env
+
+# Ses dosyaları (büyük dosyalar)
+*.wav
+*.mp3
+*.flac
+*.ogg
+sesler/
+# TestGuitar.wav'ı tut
+!TestGuitar.wav
+
+# Sıkıştırma çıktıları
+*.bin
+*.zlib
+*.compressed
+output/
+outputs/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Torch / Model cache
+*.pt
+*.pth
+~/.cache/torch/
