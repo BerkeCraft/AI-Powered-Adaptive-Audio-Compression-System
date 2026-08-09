@@ -44,18 +44,6 @@ analysis to select the optimal algorithm per segment. Includes Meta's EnCodec
 
 ---
 
-## 📁 Project Structure
-├── main.py # Main pipeline and comparison table
-├── segmenter.py # RMS analysis and segment labeling
-├── compressors.py # RLE, Huffman, quantization
-├── utils.py # SNR calculation, helper functions
-├── gui.py # Tkinter GUI
-├── rvqgan_compressor.py # EnCodec RVQ-GAN integration
-├── entropy_selector.py # Shannon entropy decision system
-├── compare_audio.py # Lossy audio export tool
-└── audio/ # Test audio files
----
-
 ## ⚙️ Installation
 
 ```bash
